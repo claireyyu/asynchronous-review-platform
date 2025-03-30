@@ -207,6 +207,5 @@ func startConsumer(id int) {
 			log.Printf("Consumer %d failed to parse message: %s", id, msg.Body)
 			msg.Nack(false, false)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
