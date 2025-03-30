@@ -187,7 +187,7 @@ func startConsumer(id int) {
 	if err != nil {
 		log.Fatalf("Consumer %d: failed to open channel: %v", id, err)
 	}
-	defer ch.Close()
+	// defer ch.Close()
 
 	ch.QueueDeclare("reviews", true, false, false, false, nil)
 	ch.Qos(1, 0, false)
