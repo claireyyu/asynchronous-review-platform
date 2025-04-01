@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/go-sql-driver/mysql"
@@ -13,8 +14,10 @@ import (
 )
 
 var (
-	db         *sql.DB
-	rabbitConn *amqp.Connection
+	db           *sql.DB
+	rabbitConn   *amqp.Connection
+	publishChan  *amqp.Channel
+	publishMutex = &sync.Mutex{}
 )
 
 type Album struct {
@@ -78,12 +81,14 @@ func main() {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
 	}
 
-	ch, err := rabbitConn.Channel()
+	publishChan, err = rabbitConn.Channel()
 	if err != nil {
-		log.Fatalf("Failed to open channel: %v", err)
+		log.Fatalf("Failed to create publishing channel: %v", err)
 	}
-	ch.QueueDeclare("reviews", true, false, false, false, nil)
-	ch.Close()
+	_, err = publishChan.QueueDeclare("reviews", true, false, false, false, nil)
+	if err != nil {
+		log.Fatalf("Failed to declare queue: %v", err)
+	}
 
 	// Start consumers
 	consumerCount := 2
@@ -148,18 +153,15 @@ func main() {
 			return
 		}
 
-		ch, err := rabbitConn.Channel()
-		if err != nil {
-			c.JSON(500, gin.H{"error": "Failed to open channel"})
-			return
-		}
-		defer ch.Close()
-
-		err = ch.Publish("", "reviews", false, false, amqp.Publishing{
+		publishMutex.Lock()
+		err = publishChan.Publish("", "reviews", false, false, amqp.Publishing{
 			ContentType: "application/json",
 			Body:        body,
 		})
+		publishMutex.Unlock()
+
 		if err != nil {
+			log.Printf("Failed to publish message: %v", err)
 			c.JSON(500, gin.H{"error": "Failed to publish message"})
 			return
 		}
