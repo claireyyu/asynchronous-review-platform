@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/go-sql-driver/mysql"
@@ -166,6 +165,35 @@ func main() {
 		}
 
 		c.Status(202)
+	})
+
+	r.GET("/review/:albumID", func(c *gin.Context) {
+		albumIDStr := c.Param("albumID")
+		albumID, err := strconv.Atoi(albumIDStr)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "Invalid albumID"})
+			return
+		}
+
+		var likes, dislikes int
+
+		err = db.QueryRow("SELECT COUNT(*) FROM reviews WHERE album_id = ? AND action = 'like'", albumID).Scan(&likes)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to count likes"})
+			return
+		}
+
+		err = db.QueryRow("SELECT COUNT(*) FROM reviews WHERE album_id = ? AND action = 'dislike'", albumID).Scan(&dislikes)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to count dislikes"})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"album_id": albumID,
+			"likes":    likes,
+			"dislikes": dislikes,
+		})
 	})
 
 	port := os.Getenv("PORT")
