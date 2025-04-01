@@ -1,23 +1,60 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/streadway/amqp"
 )
 
+// ChannelPool manages a pool of RabbitMQ channels
+type ChannelPool struct {
+	channels chan *amqp.Channel
+	conn     *amqp.Connection
+}
+
+func NewChannelPool(conn *amqp.Connection, size int) *ChannelPool {
+	pool := &ChannelPool{
+		channels: make(chan *amqp.Channel, size),
+		conn:     conn,
+	}
+	for i := 0; i < size; i++ {
+		ch, err := conn.Channel()
+		if err != nil {
+			log.Fatal(err)
+		}
+		pool.channels <- ch
+	}
+	return pool
+}
+
+func (p *ChannelPool) Get() *amqp.Channel {
+	return <-p.channels
+}
+
+func (p *ChannelPool) Put(ch *amqp.Channel) {
+	p.channels <- ch
+}
+
 var (
 	db           *sql.DB
 	rabbitConn   *amqp.Connection
-	publishChan  *amqp.Channel
+	channelPool  *ChannelPool
 	publishMutex = &sync.Mutex{}
+	
+	// Monitoring metrics
+	requestCount    int64
+	totalLatency    int64
+	requestCountMux sync.RWMutex
 )
 
 type Album struct {
@@ -44,6 +81,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
 	}
+
+	// Configure connection pool
+	db.SetMaxOpenConns(100)    // 设置最大打开连接数
+	db.SetMaxIdleConns(10)     // 设置最大空闲连接数
+	db.SetConnMaxLifetime(time.Hour)  // 设置连接最大生命周期
+
 	if err = db.Ping(); err != nil {
 		log.Fatalf("Failed to connect to DB: %v", err)
 	}
@@ -81,17 +124,21 @@ func main() {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
 	}
 
-	publishChan, err = rabbitConn.Channel()
-	if err != nil {
-		log.Fatalf("Failed to create publishing channel: %v", err)
-	}
-	_, err = publishChan.QueueDeclare("reviews", true, false, false, false, nil)
-	if err != nil {
-		log.Fatalf("Failed to declare queue: %v", err)
+	// Create channel pool instead of single channel
+	channelPool = NewChannelPool(rabbitConn, 10)
+	
+	// Initialize queue on all channels
+	for i := 0; i < 10; i++ {
+		ch := channelPool.Get()
+		_, err = ch.QueueDeclare("reviews", true, false, false, false, nil)
+		if err != nil {
+			log.Fatalf("Failed to declare queue: %v", err)
+		}
+		channelPool.Put(ch)
 	}
 
 	// Start consumers
-	consumerCount := 2
+	consumerCount := 10  // Increased from 2 to 10
 	if val := os.Getenv("CONSUMER_COUNT"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			consumerCount = n
@@ -103,6 +150,34 @@ func main() {
 
 	// Gin routes
 	r := gin.Default()
+
+	// Add middleware for monitoring and timeout
+	r.Use(gin.Recovery())
+	r.Use(gin.Logger())
+	r.Use(func(c *gin.Context) {
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+		latency := time.Since(start)
+		atomic.AddInt64(&requestCount, 1)
+		atomic.AddInt64(&totalLatency, latency.Nanoseconds())
+	})
+
+	// Add metrics endpoint
+	r.GET("/metrics", func(c *gin.Context) {
+		count := atomic.LoadInt64(&requestCount)
+		latency := atomic.LoadInt64(&totalLatency)
+		var avgLatency float64
+		if count > 0 {
+			avgLatency = float64(latency) / float64(count) / float64(time.Millisecond)
+		}
+		c.JSON(200, gin.H{
+			"total_requests": count,
+			"avg_latency_ms": avgLatency,
+		})
+	})
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
@@ -153,12 +228,14 @@ func main() {
 			return
 		}
 
-		publishMutex.Lock()
-		err = publishChan.Publish("", "reviews", false, false, amqp.Publishing{
+		// Get a channel from the pool
+		ch := channelPool.Get()
+		defer channelPool.Put(ch)
+
+		err = ch.Publish("", "reviews", false, false, amqp.Publishing{
 			ContentType: "application/json",
 			Body:        body,
 		})
-		publishMutex.Unlock()
 
 		if err != nil {
 			log.Printf("Failed to publish message: %v", err)
