@@ -22,6 +22,11 @@ type ChannelPool struct {
 	conn     *amqp.Connection
 }
 
+// NewChannelPool creates and initializes a new pool of RabbitMQ channels
+// Parameters:
+//   - conn: The RabbitMQ connection
+//   - size: Number of channels to create in the pool
+// Returns: A new ChannelPool instance
 func NewChannelPool(conn *amqp.Connection, size int) *ChannelPool {
 	pool := &ChannelPool{
 		channels: make(chan *amqp.Channel, size),
@@ -37,10 +42,12 @@ func NewChannelPool(conn *amqp.Connection, size int) *ChannelPool {
 	return pool
 }
 
+// Get retrieves a channel from the pool
 func (p *ChannelPool) Get() *amqp.Channel {
 	return <-p.channels
 }
 
+// Put returns a channel to the pool
 func (p *ChannelPool) Put(ch *amqp.Channel) {
 	p.channels <- ch
 }
@@ -57,6 +64,7 @@ var (
 	requestCountMux sync.RWMutex
 )
 
+// Data structures for the application
 type Album struct {
 	ID       int    `json:"id"`
 	Artist   string `json:"artist"`
@@ -70,8 +78,10 @@ type Review struct {
 	Action  string `json:"action"` // "like" or "dislike"
 }
 
+// Main function: Initializes the application, sets up connections, and starts the HTTP server
 func main() {
-	// MySQL connection
+	// Database Connection Setup
+	// Establishes connection to MySQL database with connection pooling configuration
 	dsn := os.Getenv("DB_DSN")
 	if dsn == "" {
 		log.Fatal("DB_DSN environment variable not set")
@@ -83,15 +93,16 @@ func main() {
 	}
 
 	// Configure connection pool
-	db.SetMaxOpenConns(100)    // 设置最大打开连接数
-	db.SetMaxIdleConns(50)     // 设置最大空闲连接数
-	db.SetConnMaxLifetime(time.Hour)  // 设置连接最大生命周期
+	db.SetMaxOpenConns(100)
+	db.SetMaxIdleConns(50)
+	db.SetConnMaxLifetime(time.Hour)
 
 	if err = db.Ping(); err != nil {
 		log.Fatalf("Failed to connect to DB: %v", err)
 	}
 
-	// Create albums and reviews tables
+	// Database Schema Setup
+	// Creates necessary tables if they don't exist
 	_, err = db.Exec(`
 	CREATE TABLE IF NOT EXISTS albums (
 		id INT AUTO_INCREMENT PRIMARY KEY,
@@ -114,16 +125,15 @@ func main() {
 		log.Fatalf("Failed to create reviews table: %v", err)
 	}
 
+	// Create index for review lookup optimization
 	err = ensureReviewIndexExists(db)
 	if err != nil {
 		log.Fatalf("Failed to ensure index: %v", err)
 	}
 	
-	// RabbitMQ setup
-	rabbitURL := os.Getenv("RABBIT_URL")
-	if rabbitURL == "" {
-		rabbitURL = "amqp://guest:guest@localhost:5672/"
-	}
+	// RabbitMQ Setup
+	// Initializes RabbitMQ connection and channel pool for message queue processing
+	rabbitURL = "amqp://guest:guest@localhost:5672/"
 	rabbitConn, err = amqp.Dial(rabbitURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
@@ -133,7 +143,7 @@ func main() {
 	channelPool = NewChannelPool(rabbitConn, 50)
 	
 	// Initialize queue on all channels
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 50; i++ {
 		ch := channelPool.Get()
 		_, err = ch.QueueDeclare("reviews", true, false, false, false, nil)
 		if err != nil {
@@ -142,7 +152,8 @@ func main() {
 		channelPool.Put(ch)
 	}
 
-	// Start consumers
+	// Consumer Setup
+	// Starts multiple consumer goroutines to process review messages
 	consumerCount := 50  
 	if val := os.Getenv("CONSUMER_COUNT"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
@@ -153,41 +164,18 @@ func main() {
 		go startConsumer(i)
 	}
 
-	// Gin routes
+	// HTTP Server Setup with Gin Framework
+	// Configures routes and middleware for the REST API
 	r := gin.Default()
 
-	// Add middleware for monitoring and timeout
-	r.Use(gin.Recovery())
-	r.Use(gin.Logger())
-	r.Use(func(c *gin.Context) {
-		start := time.Now()
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-		defer cancel()
-		c.Request = c.Request.WithContext(ctx)
-		c.Next()
-		latency := time.Since(start)
-		atomic.AddInt64(&requestCount, 1)
-		atomic.AddInt64(&totalLatency, latency.Nanoseconds())
-	})
-
-	// Add metrics endpoint
-	r.GET("/metrics", func(c *gin.Context) {
-		count := atomic.LoadInt64(&requestCount)
-		latency := atomic.LoadInt64(&totalLatency)
-		var avgLatency float64
-		if count > 0 {
-			avgLatency = float64(latency) / float64(count) / float64(time.Millisecond)
-		}
-		c.JSON(200, gin.H{
-			"total_requests": count,
-			"avg_latency_ms": avgLatency,
-		})
-	})
-
+	// Health Check Endpoint
+	// Provides a simple endpoint to check if the service is running
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
+	// Album Management Endpoints
+	// Handles album creation and retrieval
 	r.POST("/albums", func(c *gin.Context) {
 		var album Album
 		if err := c.ShouldBindJSON(&album); err != nil {
@@ -204,6 +192,8 @@ func main() {
 		c.JSON(200, gin.H{"id": id})
 	})
 
+	// Review Management Endpoints
+	// Handles review submission and retrieval
 	r.POST("/review/:action/:albumID", func(c *gin.Context) {
 		action := c.Param("action")
 		albumIDStr := c.Param("albumID")
@@ -225,13 +215,9 @@ func main() {
 		}
 
 		body, _ := json.Marshal(review)
-
-		async := os.Getenv("ASYNC_MODE")
-		if async == "false" {
-			saveReview(review)
-			c.Status(200)
-			return
-		}
+		saveReview(review)
+		c.Status(200)
+		return
 
 		// Get a channel from the pool
 		ch := channelPool.Get()
@@ -280,13 +266,14 @@ func main() {
 		})
 	})
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+	// Server Start
+	// Initializes the HTTP server on the specified port
+	port = "8080"
 	r.Run(":" + port)
 }
 
+// Database Operations
+// saveReview persists a review to the database with a timeout context
 func saveReview(review Review) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -297,21 +284,25 @@ func saveReview(review Review) {
 	}
 }
 
+// Message Queue Consumer
+// startConsumer initializes a consumer that processes review messages from RabbitMQ
 func startConsumer(id int) {
-	ch, err := rabbitConn.Channel()
-	if err != nil {
-		log.Fatalf("Consumer %d: failed to open channel: %v", id, err)
-	}
-	// defer ch.Close()
+	// Get a channel from the pool
+	ch := channelPool.Get()
+	defer channelPool.Put(ch)  // Return the channel to the pool when done
 
+	// Declare queue and set QoS
 	ch.QueueDeclare("reviews", true, false, false, false, nil)
 	ch.Qos(1, 0, false)
 
+	// Start consuming messages
 	msgs, err := ch.Consume("reviews", "", false, false, false, false, nil)
 	if err != nil {
-		log.Fatalf("Consumer %d: failed to start consuming: %v", id, err)
+		log.Printf("Consumer %d: failed to start consuming: %v", id, err)
+		return
 	}
 
+	// Process messages
 	for msg := range msgs {
 		var review Review
 		if err := json.Unmarshal(msg.Body, &review); err == nil {
@@ -325,6 +316,8 @@ func startConsumer(id int) {
 	}
 }
 
+// Database Index Management
+// ensureReviewIndexExists creates an index on the reviews table if it doesn't exist
 func ensureReviewIndexExists(db *sql.DB) error {
 	rows, err := db.Query(`SHOW INDEX FROM reviews WHERE Key_name = 'idx_album_action'`)
 	if err != nil {
