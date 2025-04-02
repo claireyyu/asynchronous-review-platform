@@ -84,7 +84,7 @@ func main() {
 
 	// Configure connection pool
 	db.SetMaxOpenConns(100)    // 设置最大打开连接数
-	db.SetMaxIdleConns(10)     // 设置最大空闲连接数
+	db.SetMaxIdleConns(50)     // 设置最大空闲连接数
 	db.SetConnMaxLifetime(time.Hour)  // 设置连接最大生命周期
 
 	if err = db.Ping(); err != nil {
@@ -114,6 +114,13 @@ func main() {
 		log.Fatalf("Failed to create reviews table: %v", err)
 	}
 
+	// Create index for review lookup optimization
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_album_action ON reviews(album_id, action)`)
+	if err != nil {
+		log.Fatalf("Failed to create index: %v", err)
+	}
+
+
 	// RabbitMQ setup
 	rabbitURL := os.Getenv("RABBIT_URL")
 	if rabbitURL == "" {
@@ -125,7 +132,7 @@ func main() {
 	}
 
 	// Create channel pool instead of single channel
-	channelPool = NewChannelPool(rabbitConn, 10)
+	channelPool = NewChannelPool(rabbitConn, 50)
 	
 	// Initialize queue on all channels
 	for i := 0; i < 10; i++ {
@@ -138,7 +145,7 @@ func main() {
 	}
 
 	// Start consumers
-	consumerCount := 10  // Increased from 2 to 10
+	consumerCount := 50  
 	if val := os.Getenv("CONSUMER_COUNT"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			consumerCount = n
@@ -283,7 +290,10 @@ func main() {
 }
 
 func saveReview(review Review) {
-	_, err := db.Exec("INSERT INTO reviews (album_id, action) VALUES (?, ?)", review.AlbumID, review.Action)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := db.ExecContext(ctx, "INSERT INTO reviews (album_id, action) VALUES (?, ?)", review.AlbumID, review.Action)
 	if err != nil {
 		log.Printf("Failed to insert review: %v", err)
 	}
