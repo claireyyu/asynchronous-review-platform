@@ -114,13 +114,11 @@ func main() {
 		log.Fatalf("Failed to create reviews table: %v", err)
 	}
 
-	// Create index for review lookup optimization
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_album_action ON reviews(album_id, action)`)
+	err = ensureReviewIndexExists(db)
 	if err != nil {
-		log.Fatalf("Failed to create index: %v", err)
+		log.Fatalf("Failed to ensure index: %v", err)
 	}
-
-
+	
 	// RabbitMQ setup
 	rabbitURL := os.Getenv("RABBIT_URL")
 	if rabbitURL == "" {
@@ -326,3 +324,24 @@ func startConsumer(id int) {
 		}
 	}
 }
+
+func ensureReviewIndexExists(db *sql.DB) error {
+	rows, err := db.Query(`SHOW INDEX FROM reviews WHERE Key_name = 'idx_album_action'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		log.Println("Index idx_album_action already exists")
+		return nil
+	}
+
+	_, err = db.Exec(`CREATE INDEX idx_album_action ON reviews(album_id, action)`)
+	if err != nil {
+		return err
+	}
+	log.Println("Created index idx_album_action")
+	return nil
+}
+
