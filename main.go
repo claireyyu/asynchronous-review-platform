@@ -8,7 +8,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +25,7 @@ type ChannelPool struct {
 // Parameters:
 //   - conn: The RabbitMQ connection
 //   - size: Number of channels to create in the pool
+//
 // Returns: A new ChannelPool instance
 func NewChannelPool(conn *amqp.Connection, size int) *ChannelPool {
 	pool := &ChannelPool{
@@ -57,11 +57,14 @@ var (
 	rabbitConn   *amqp.Connection
 	channelPool  *ChannelPool
 	publishMutex = &sync.Mutex{}
-	
+
 	// Monitoring metrics
 	requestCount    int64
 	totalLatency    int64
 	requestCountMux sync.RWMutex
+
+	// Configuration
+	port = "8080"
 )
 
 // Data structures for the application
@@ -82,9 +85,9 @@ type Review struct {
 func main() {
 	// Database Connection Setup
 	// Establishes connection to MySQL database with connection pooling configuration
-	dsn := os.Getenv("DB_DSN")
-	if dsn == "" {
-		log.Fatal("DB_DSN environment variable not set")
+	dsn := "root:your_password@tcp(database-2.cqzfidh4zvkc.us-west-2.rds.amazonaws.com:3306)/your_database_name"
+	if val := os.Getenv("DB_DSN"); val != "" {
+		dsn = val
 	}
 	var err error
 	db, err = sql.Open("mysql", dsn)
@@ -130,10 +133,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to ensure index: %v", err)
 	}
-	
+
 	// RabbitMQ Setup
 	// Initializes RabbitMQ connection and channel pool for message queue processing
-	rabbitURL = "amqp://guest:guest@localhost:5672/"
+	rabbitURL := "amqp://guest:guest@localhost:5672/"
+	if val := os.Getenv("RABBITMQ_URL"); val != "" {
+		rabbitURL = val
+	}
 	rabbitConn, err = amqp.Dial(rabbitURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
@@ -141,7 +147,7 @@ func main() {
 
 	// Create channel pool instead of single channel
 	channelPool = NewChannelPool(rabbitConn, 50)
-	
+
 	// Initialize queue on all channels
 	for i := 0; i < 50; i++ {
 		ch := channelPool.Get()
@@ -154,12 +160,13 @@ func main() {
 
 	// Consumer Setup
 	// Starts multiple consumer goroutines to process review messages
-	consumerCount := 50  
+	consumerCount := 50
 	if val := os.Getenv("CONSUMER_COUNT"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			consumerCount = n
 		}
 	}
+	// Start a new goroutine for each consumer to process messages concurrently
 	for i := 0; i < consumerCount; i++ {
 		go startConsumer(i)
 	}
@@ -268,7 +275,6 @@ func main() {
 
 	// Server Start
 	// Initializes the HTTP server on the specified port
-	port = "8080"
 	r.Run(":" + port)
 }
 
@@ -289,7 +295,7 @@ func saveReview(review Review) {
 func startConsumer(id int) {
 	// Get a channel from the pool
 	ch := channelPool.Get()
-	defer channelPool.Put(ch)  // Return the channel to the pool when done
+	defer channelPool.Put(ch) // Return the channel to the pool when done
 
 	// Declare queue and set QoS
 	ch.QueueDeclare("reviews", true, false, false, false, nil)
@@ -337,4 +343,3 @@ func ensureReviewIndexExists(db *sql.DB) error {
 	log.Println("Created index idx_album_action")
 	return nil
 }
-
