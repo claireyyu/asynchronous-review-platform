@@ -96,8 +96,8 @@ func main() {
 	}
 
 	// Configure connection pool
-	db.SetMaxOpenConns(100)
-	db.SetMaxIdleConns(50)
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(time.Hour)
 
 	if err = db.Ping(); err != nil {
@@ -160,7 +160,7 @@ func main() {
 
 	// Consumer Setup
 	// Starts multiple consumer goroutines to process review messages
-	consumerCount := 50
+	consumerCount := 10
 	if val := os.Getenv("CONSUMER_COUNT"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			consumerCount = n
