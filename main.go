@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -53,18 +52,12 @@ func (p *ChannelPool) Put(ch *amqp.Channel) {
 }
 
 var (
-	db           *sql.DB
-	rabbitConn   *amqp.Connection
-	channelPool  *ChannelPool
-	publishMutex = &sync.Mutex{}
-
-	// Monitoring metrics
-	requestCount    int64
-	totalLatency    int64
-	requestCountMux sync.RWMutex
-
+	db          *sql.DB
+	rabbitConn  *amqp.Connection
+	channelPool *ChannelPool
 	// Configuration
-	port = "8080"
+	port       = "8080"
+	maxRetries = 3
 )
 
 // Data structures for the application
@@ -85,9 +78,9 @@ type Review struct {
 func main() {
 	// Database Connection Setup
 	// Establishes connection to MySQL database with connection pooling configuration
-	dsn := "root:your_password@tcp(database-2.cqzfidh4zvkc.us-west-2.rds.amazonaws.com:3306)/your_database_name"
-	if val := os.Getenv("DB_DSN"); val != "" {
-		dsn = val
+	dsn := os.Getenv("DB_DSN")
+	if dsn == "" {
+		log.Fatal("DB_DSN environment variable is required")
 	}
 	var err error
 	db, err = sql.Open("mysql", dsn)
@@ -96,8 +89,20 @@ func main() {
 	}
 
 	// Configure connection pool
-	db.SetMaxOpenConns(50)
-	db.SetMaxIdleConns(25)
+	maxOpenConns := 30
+	maxIdleConns := 10
+	if val := os.Getenv("DB_MAX_OPEN_CONNS"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			maxOpenConns = n
+		}
+	}
+	if val := os.Getenv("DB_MAX_IDLE_CONNS"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			maxIdleConns = n
+		}
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
 	db.SetConnMaxLifetime(time.Hour)
 
 	if err = db.Ping(); err != nil {
@@ -136,9 +141,9 @@ func main() {
 
 	// RabbitMQ Setup
 	// Initializes RabbitMQ connection and channel pool for message queue processing
-	rabbitURL := "amqp://guest:guest@localhost:5672/"
-	if val := os.Getenv("RABBITMQ_URL"); val != "" {
-		rabbitURL = val
+	rabbitURL := os.Getenv("RABBITMQ_URL")
+	if rabbitURL == "" {
+		log.Fatal("RABBITMQ_URL environment variable is required")
 	}
 	rabbitConn, err = amqp.Dial(rabbitURL)
 	if err != nil {
@@ -146,10 +151,10 @@ func main() {
 	}
 
 	// Create channel pool instead of single channel
-	channelPool = NewChannelPool(rabbitConn, 50)
+	channelPool = NewChannelPool(rabbitConn, 10)
 
 	// Initialize queue on all channels
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 10; i++ {
 		ch := channelPool.Get()
 		_, err = ch.QueueDeclare("reviews", true, false, false, false, nil)
 		if err != nil {
@@ -221,14 +226,24 @@ func main() {
 			Action:  action,
 		}
 
-		body, _ := json.Marshal(review)
-		saveReview(review)
-		c.Status(200)
-		return
+		async := os.Getenv("ASYNC_MODE")
+		if async == "false" {
+			saveReview(review)
+			c.Status(200)
+			return
+		}
 
 		// Get a channel from the pool
 		ch := channelPool.Get()
 		defer channelPool.Put(ch)
+
+		// Marshal review to JSON before publishing
+		body, err := json.Marshal(review)
+		if err != nil {
+			log.Printf("Failed to marshal review: %v", err)
+			c.JSON(500, gin.H{"error": "Failed to process review"})
+			return
+		}
 
 		err = ch.Publish("", "reviews", false, false, amqp.Publishing{
 			ContentType: "application/json",
@@ -281,13 +296,22 @@ func main() {
 // Database Operations
 // saveReview persists a review to the database with a timeout context
 func saveReview(review Review) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err = db.ExecContext(ctx, "INSERT INTO reviews (album_id, action) VALUES (?, ?)", review.AlbumID, review.Action)
+		cancel()
 
-	_, err := db.ExecContext(ctx, "INSERT INTO reviews (album_id, action) VALUES (?, ?)", review.AlbumID, review.Action)
-	if err != nil {
-		log.Printf("Failed to insert review: %v", err)
+		if err == nil {
+			return
+		}
+
+		log.Printf("Attempt %d failed to insert review: %v", i+1, err)
+		if i < maxRetries-1 {
+			time.Sleep(time.Second * time.Duration(i+1))
+		}
 	}
+	log.Printf("Failed to insert review after %d attempts: %v", maxRetries, err)
 }
 
 // Message Queue Consumer
@@ -297,8 +321,7 @@ func startConsumer(id int) {
 	ch := channelPool.Get()
 	defer channelPool.Put(ch) // Return the channel to the pool when done
 
-	// Declare queue and set QoS
-	ch.QueueDeclare("reviews", true, false, false, false, nil)
+	// Set QoS
 	ch.Qos(1, 0, false)
 
 	// Start consuming messages
@@ -317,7 +340,8 @@ func startConsumer(id int) {
 			log.Printf("Consumer %d processed review for album %d [%s]", id, review.AlbumID, review.Action)
 		} else {
 			log.Printf("Consumer %d failed to parse message: %s", id, msg.Body)
-			msg.Nack(false, false)
+			// Send to dead letter queue instead of discarding
+			msg.Nack(false, true)
 		}
 	}
 }
